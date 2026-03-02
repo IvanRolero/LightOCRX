@@ -62,8 +62,8 @@ struct PointF {
 // Rotation Classification Model Class
 class RotationCLSModel {
 private:
-    const int TARGET_H = 48;  // Typical PaddleCLS input size
-    const int TARGET_W = 320;
+    const int TARGET_H = 80;  // Typical PaddleCLS input size
+    const int TARGET_W = 160;
     
     std::vector<std::string> labels_ = {"normal", "rotated_180"};
     Ort::Env env_;
@@ -72,6 +72,10 @@ private:
     std::vector<const char*> output_names_;
     std::vector<std::string> input_names_str_;
     std::vector<std::string> output_names_str_;
+    
+    // Normalization parameters (ImageNet stats)
+    const float mean_[3] = {0.485f, 0.456f, 0.406f};
+    const float std_[3] = {0.229f, 0.224f, 0.225f};
 
 public:
     RotationCLSModel(const std::string& model_path)
@@ -125,33 +129,30 @@ public:
             }
         }
 
+        // Resize to target dimensions (stretch to fit exactly)
         std::vector<float> input(3 * TARGET_H * TARGET_W);
         
-        float scale = std::min(float(TARGET_W) / w, float(TARGET_H) / h);
-        int new_w = int(w * scale);
-        int new_h = int(h * scale);
-        
-        int pad_w = (TARGET_W - new_w) / 2;
-        int pad_h = (TARGET_H - new_h) / 2;
-        
-        std::fill(input.begin(), input.end(), 0.0f);
-        
-        for (int y = 0; y < new_h; y++) {
-            int sy = y * h / new_h;
+        for (int y = 0; y < TARGET_H; y++) {
+            int sy = y * h / TARGET_H;
             sy = std::min(sy, h - 1);
             
-            for (int x = 0; x < new_w; x++) {
-                int sx = x * w / new_w;
+            for (int x = 0; x < TARGET_W; x++) {
+                int sx = x * w / TARGET_W;
                 sx = std::min(sx, w - 1);
                 
+                // Paddle models often expect BGR order (channel 2,1,0)
                 for (int channel = 0; channel < 3; channel++) {
-                    int src_idx = (sy * w + sx) * 3 + channel;
-                    float pixel = rgb_data[src_idx] / 255.0f;
+                    // Reverse channel order: RGB -> BGR
+                    int src_channel = 2 - channel;
+                    int src_idx = (sy * w + sx) * 3 + src_channel;
                     
-                    int dst_y = pad_h + y;
-                    int dst_x = pad_w + x;
-                    int dst_idx = channel * TARGET_H * TARGET_W + dst_y * TARGET_W + dst_x;
-                    input[dst_idx] = pixel;
+                    // Normalize: (x/255 - mean) / std
+                    float pixel = rgb_data[src_idx] / 255.0f;
+                    float normalized = (pixel - mean_[channel]) / std_[channel];
+                    
+                    // CHW format
+                    int dst_idx = channel * TARGET_H * TARGET_W + y * TARGET_W + x;
+                    input[dst_idx] = normalized;
                 }
             }
         }
@@ -184,16 +185,38 @@ public:
         }
 
         const float* out_data = outputs[0].GetTensorData<float>();
-        size_t num_elements = outputs[0].GetTensorTypeAndShapeInfo().GetElementCount();
+        auto type_info = outputs[0].GetTensorTypeAndShapeInfo();
+        size_t num_elements = type_info.GetElementCount();
         
-        // Find the index with maximum value (no softmax needed for argmax)
+        // Apply softmax for better probability interpretation
+        std::vector<float> probs(num_elements);
+        float max_val = *std::max_element(out_data, out_data + num_elements);
+        float sum = 0.0f;
+        
+        for (size_t i = 0; i < num_elements; i++) {
+            probs[i] = std::exp(out_data[i] - max_val);
+            sum += probs[i];
+        }
+        
+        for (size_t i = 0; i < num_elements; i++) {
+            probs[i] /= sum;
+        }
+        
+        // Find class with highest probability
         int max_idx = 0;
-        float max_val = out_data[0];
+        float max_prob = probs[0];
         for (size_t i = 1; i < num_elements; i++) {
-            if (out_data[i] > max_val) {
-                max_val = out_data[i];
+            if (probs[i] > max_prob) {
+                max_prob = probs[i];
                 max_idx = i;
             }
+        }
+        
+        // Optional: Add confidence threshold
+        const float CONFIDENCE_THRESHOLD = 0.6f;
+        if (max_prob < CONFIDENCE_THRESHOLD) {
+            // Low confidence, assume normal
+            return 0;
         }
 
         // Return 0 for normal (upright), 180 for rotated
@@ -602,7 +625,6 @@ static void draw_debug_boxes(const std::string& image_path,
     // Convert to RGBA for drawing
     std::vector<uint8_t> image_rgba(img_w * img_h * 4);
     if (img_channels == 4) {
-        // Use vector constructor with iterators instead of memcpy
         image_rgba.assign(img_data, img_data + (img_w * img_h * 4));
     } else if (img_channels == 3) {
         auto* src = img_data;
@@ -789,7 +811,6 @@ std::vector<CropResult> TextDetector::detect_and_crop(const std::string& image_p
         throw std::runtime_error("Failed to load image: " + image_path);
     }
 
-    // Use vector constructor with iterators instead of memcpy
     std::vector<uint8_t> original_image(img_data, img_data + (img_w * img_h * img_channels));
 
     std::vector<uint8_t> image_rgb;
@@ -1011,7 +1032,6 @@ std::vector<CropResult> TextDetector::detect_and_crop(const std::string& image_p
             fs::create_directories("cropped");
         } catch (const std::exception& e) {
             std::cerr << "Warning: Failed to create cropped directory: " << e.what() << std::endl;
-            // Continue without saving crops
         }
     }
 
@@ -1036,11 +1056,9 @@ std::vector<CropResult> TextDetector::detect_and_crop(const std::string& image_p
                     rotate180(cropped.data(), cw, ch, img_channels, rotated);
                     cropped = std::move(rotated);
                     
-                    // Log that we corrected this box
                     std::cout << "    Box " << (i + 1) << ": 180 rotation detected and corrected\n";
                 }
             } catch (const std::exception& e) {
-                // Skip rotation for this box if classification fails
                 std::cerr << "Warning: Rotation classification failed for box " << i + 1 
                           << ": " << e.what() << std::endl;
             }
@@ -1063,5 +1081,5 @@ std::vector<CropResult> TextDetector::detect_and_crop(const std::string& image_p
 
     stbi_image_free(img_data);
     return results;
-
 }
+
