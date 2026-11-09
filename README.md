@@ -1,6 +1,6 @@
 # LightOCRX
 
-LightOCRX is a lightweight C++ inference engine for PaddleOCR ONNX models (v4 and v5). It prioritizes speed, low memory footprint, and portability, making it ideal for low-end devices.
+LightOCRX is a lightweight C++ inference engine for PaddleOCR ONNX models (v4 v5 and v6). It prioritizes speed, low memory footprint, and portability, making it ideal for low-end devices.
 
 ---
 
