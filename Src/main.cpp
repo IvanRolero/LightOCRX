@@ -1,3 +1,4 @@
+//main.cpp
 /* LightOCRX Lightweight OCR software
  *
  * Copyright (C) 2026 Ivan Rolero
@@ -25,6 +26,8 @@
 #include "text_detect.h"
 #include "text_recon.h"
 #include "pdf_export.h"
+
+
 #include "stb_image.h"
 
 namespace fs = std::filesystem;
@@ -36,12 +39,14 @@ R"(Usage: fullocr <detection_model.onnx> <recognition_model.onnx> <images...> [o
 Arguments:
   detection_model.onnx    Path to detection model
   recognition_model.onnx  Path to recognition model
-  images...               One or more PNG/JPG image files or a directory
+  images...               One or more PNG/JPG image files, a directory, or a
+                          glob pattern (e.g. *.jpg). Glob patterns that the
+                          shell did not expand are expanded by the program.
 
 Options:
   -boxt             Box threshold (default: 0.6)
   -bint             Binarization threshold (default: 0.3)
-  -unclip           Unclip ratio (default: 2.0)
+  -unclip           Unclip ratio (default: 1.5)
   -targetsize <int> Target size for detection (default: 640)
   -savecrops <0/1>  Save cropped text regions (default: 0)
   -debugboxes <0/1> Draw detected boxes on an image (default: 0)
@@ -70,7 +75,19 @@ Examples:
 }
 
 static bool is_flag(const std::string& s) {
-    return !s.empty() && s[0] == '-';
+    // A bare "-" is treated as an argument (often means stdin), not a flag.
+    return s.size() > 1 && s[0] == '-';
+}
+
+static const std::vector<std::string> IMAGE_EXTS = {
+    ".jpg", ".jpeg", ".png", ".jfif", ".bmp", ".tiff", ".tif"
+};
+
+static bool is_image_extension(const std::string& ext_lower) {
+    for (const auto& e : IMAGE_EXTS) {
+        if (ext_lower == e) return true;
+    }
+    return false;
 }
 
 static std::vector<std::string> expand_directory(const std::string& path) {
@@ -83,8 +100,7 @@ static std::vector<std::string> expand_directory(const std::string& path) {
                     std::string ext = entry.path().extension().string();
                     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
 
-                    if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" ||
-                        ext == ".jfif" || ext == ".bmp" || ext == ".tiff" || ext == ".tif") {
+                    if (is_image_extension(ext)) {
                         image_files.push_back(entry.path().string());
                     }
                 }
@@ -101,10 +117,88 @@ static std::vector<std::string> expand_directory(const std::string& path) {
     return image_files;
 }
 
-static std::vector<std::string> collect_image_files(int argc, char** argv, int start_index) {
-    std::vector<std::string> all_images;
+// True if the argument looks like a shell glob pattern the shell failed to
+// expand (so it reached us literally). We only treat it as a glob when it
+// contains wildcard metacharacters AND does not exist as a real file/dir.
+static bool looks_like_glob(const std::string& s) {
+    if (s.find_first_of("*?[") == std::string::npos) return false;
+    std::error_code ec;
+    return !fs::exists(s, ec);
+}
 
-    for (int i = start_index; i < argc; i++) {
+// Simple iterative wildcard match supporting '*' and '?'.
+static bool glob_match(const std::string& pattern, const std::string& name) {
+    size_t p = 0, n = 0;
+    size_t star = std::string::npos;  // position in pattern of last '*'
+    size_t match = 0;                 // position in name to resume from after '*'
+
+    while (n < name.size()) {
+        if (p < pattern.size() && (pattern[p] == '?' || pattern[p] == name[n])) {
+            p++; n++;
+        } else if (p < pattern.size() && pattern[p] == '*') {
+            star = p;
+            match = n;
+            p++;
+        } else if (star != std::string::npos) {
+            p = star + 1;
+            match++;
+            n = match;
+        } else {
+            return false;
+        }
+    }
+    while (p < pattern.size() && pattern[p] == '*') p++;
+    return p == pattern.size();
+}
+
+// Expand a glob pattern (e.g. "*.jpg", "images/*.png") against the filesystem.
+// Returns a sorted, de-duplicated list of matching image files.
+static std::vector<std::string> expand_glob(const std::string& pattern) {
+    std::vector<std::string> image_files;
+
+    fs::path p(pattern);
+    fs::path parent = p.parent_path().empty() ? fs::path(".") : p.parent_path();
+    std::string file_pattern = p.filename().string();
+
+    std::error_code ec;
+    if (!fs::is_directory(parent, ec)) return image_files;
+
+    try {
+        for (const auto& entry : fs::directory_iterator(parent)) {
+            if (!fs::is_regular_file(entry.path())) continue;
+
+            std::string name = entry.path().filename().string();
+            if (!glob_match(file_pattern, name)) continue;
+
+            std::string ext = entry.path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            if (!is_image_extension(ext)) continue;
+
+            image_files.push_back((parent / name).string());
+        }
+        std::sort(image_files.begin(), image_files.end());
+        image_files.erase(std::unique(image_files.begin(), image_files.end()),
+                          image_files.end());
+    } catch (const std::exception& e) {
+        std::cerr << "Error expanding glob '" << pattern << "': " << e.what() << "\n";
+    }
+
+    return image_files;
+}
+
+// Collect image files from the positional arguments starting at start_index.
+// Stops at the first flag argument (so options after the image list are left
+// for the option parser). The index at which parsing stopped is written to
+// option_start_out — this is the real index of the first option (or argc),
+// NOT 3 + image count, because a single directory/glob argument can expand
+// to many files.
+static std::vector<std::string> collect_image_files(int argc, char** argv,
+                                                    int start_index,
+                                                    int& option_start_out) {
+    std::vector<std::string> all_images;
+    int i = start_index;
+
+    for (; i < argc; i++) {
         std::string arg = argv[i];
 
         if (is_flag(arg)) {
@@ -112,8 +206,18 @@ static std::vector<std::string> collect_image_files(int argc, char** argv, int s
         }
 
         std::vector<std::string> files = expand_directory(arg);
+
+        // If the argument did not resolve to an existing file/dir but looks
+        // like a glob pattern (e.g. "*.jpg" passed through by the shell),
+        // expand it ourselves.
+        if (files.empty() && looks_like_glob(arg)) {
+            files = expand_glob(arg);
+        }
+
         all_images.insert(all_images.end(), files.begin(), files.end());
     }
+
+    option_start_out = i;
 
     std::sort(all_images.begin(), all_images.end());
     all_images.erase(std::unique(all_images.begin(), all_images.end()), all_images.end());
@@ -287,7 +391,10 @@ int main(int argc, char** argv) {
     std::string det_model = argv[1];
     std::string rec_model = argv[2];
 
-    std::vector<std::string> image_paths = collect_image_files(argc, argv, 3);
+    // Collect positional image arguments. option_start is the real argv index
+    // at which the option list begins (the first flag, or argc if none).
+    int option_start = 3;
+    std::vector<std::string> image_paths = collect_image_files(argc, argv, 3, option_start);
 
     if (image_paths.empty()) {
         std::cerr << "Error: No valid image files found.\n";
@@ -305,7 +412,6 @@ int main(int argc, char** argv) {
     bool use_text_cls = false;
     std::string cls_model_path;
 
-    int option_start = 3 + (int)image_paths.size();
     for (int i = option_start; i < argc; i++) {
         std::string arg = argv[i];
 
