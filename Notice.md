@@ -116,6 +116,7 @@ SOFTWARE.
 - **License:** Apache License 2.0
 - **Link:** https://github.com/PaddlePaddle/PaddleOCR
 - **Link:** https://huggingface.co/nathanfhh/PaddleOCR-ONNX
+- **Link:** https://huggingface.co/PaddlePaddle
 
 Copyright (c) PaddlePaddle Authors
 Licensed under the Apache License, Version 2.0 (the "License");
