@@ -1,13 +1,13 @@
 /* LightOCRX Lightweight OCR software
  *
  * Copyright (C) 2026 Ivan Rolero
- * 
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
+ *
  *     http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -21,12 +21,10 @@
 #include <filesystem>
 #include <algorithm>
 #include <fstream>
-
+#include <cstdio>
 #include "text_detect.h"
 #include "text_recon.h"
 #include "pdf_export.h"
-
-
 #include "stb_image.h"
 
 namespace fs = std::filesystem;
@@ -55,6 +53,7 @@ Options:
   -minconf <float>  Minimum confidence for PDF export (default: 0.3)
   -pdftext          Export PDF as text-only (white background, black visible text, no images)
   -text <path>      Export recognized text to a text file (plain text format)
+  -json <path>      Export detected polygons + recognized text as JSON (for interactive GUI overlay)
   -textcls <0/1>    Enable/disable text orientation classification and 180 degrees rotation correction (default: 0)
   -clsmodel <path>  Path to rotation classification model (required if -textcls 1)
   -h, --help        Show this help message
@@ -65,6 +64,7 @@ Examples:
   lightocrx det.onnx rec.onnx images/ -pdf output.pdf  # Process all images in directory
   lightocrx det.onnx rec.onnx image1.jpg image2.jpg -pdf output.pdf -pdftext  # Text-only PDF
   lightocrx det.onnx rec.onnx image1.jpg image2.jpg -text output.txt  # Export plain text
+  lightocrx det.onnx rec.onnx image.jpg -json regions.json  # Export polygons for GUI overlay
   lightocrx det.onnx rec.onnx image.jpg -textcls 1 -clsmodel cls.onnx  # Enable rotation correction
 )";
 }
@@ -75,21 +75,21 @@ static bool is_flag(const std::string& s) {
 
 static std::vector<std::string> expand_directory(const std::string& path) {
     std::vector<std::string> image_files;
-    
+
     try {
         if (fs::exists(path) && fs::is_directory(path)) {
             for (const auto& entry : fs::directory_iterator(path)) {
                 if (fs::is_regular_file(entry.path())) {
                     std::string ext = entry.path().extension().string();
                     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-                    
-                    if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" || 
+
+                    if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" ||
                         ext == ".jfif" || ext == ".bmp" || ext == ".tiff" || ext == ".tif") {
                         image_files.push_back(entry.path().string());
                     }
                 }
             }
-            
+
             std::sort(image_files.begin(), image_files.end());
         } else if (fs::exists(path) && fs::is_regular_file(path)) {
             image_files.push_back(path);
@@ -97,27 +97,27 @@ static std::vector<std::string> expand_directory(const std::string& path) {
     } catch (const std::exception& e) {
         std::cerr << "Error accessing path '" << path << "': " << e.what() << "\n";
     }
-    
+
     return image_files;
 }
 
 static std::vector<std::string> collect_image_files(int argc, char** argv, int start_index) {
     std::vector<std::string> all_images;
-    
+
     for (int i = start_index; i < argc; i++) {
         std::string arg = argv[i];
-        
+
         if (is_flag(arg)) {
             break;
         }
-        
+
         std::vector<std::string> files = expand_directory(arg);
         all_images.insert(all_images.end(), files.begin(), files.end());
     }
-    
+
     std::sort(all_images.begin(), all_images.end());
     all_images.erase(std::unique(all_images.begin(), all_images.end()), all_images.end());
-    
+
     return all_images;
 }
 
@@ -127,23 +127,23 @@ static bool export_text_file(
     const std::vector<std::string>& image_paths,
     const std::vector<std::vector<OCRTextBox>>& all_pages_boxes,
     float min_confidence = 0.3f) {
-    
+
     try {
         std::ofstream out_file(output_path);
         if (!out_file.is_open()) {
             std::cerr << "Error: Could not open text file for writing: " << output_path << "\n";
             return false;
         }
-        
+
         int total_text_blocks = 0;
-        
+
         for (size_t page_idx = 0; page_idx < image_paths.size(); page_idx++) {
             const std::string& image_path = image_paths[page_idx];
             const std::vector<OCRTextBox>& boxes = all_pages_boxes[page_idx];
-            
-            out_file << "--- Page " << (page_idx + 1) << ": " 
+
+            out_file << "--- Page " << (page_idx + 1) << ": "
                      << fs::path(image_path).filename().string() << " ---\n";
-            
+
             bool page_has_text = false;
             for (const auto& box : boxes) {
                 if (!box.text.empty() && box.text_confidence >= min_confidence) {
@@ -152,24 +152,128 @@ static bool export_text_file(
                     page_has_text = true;
                 }
             }
-            
+
             out_file << "\n";
-            
+
             if (!page_has_text) {
                 out_file << "[No text detected or all text below confidence threshold]\n\n";
             }
         }
-        
+
         out_file.close();
-        
+
         std::cout << "\n Saved text file: " << output_path << std::endl;
         std::cout << "  Total pages: " << image_paths.size() << std::endl;
         std::cout << "  Total text lines exported: " << total_text_blocks << std::endl;
         std::cout << "  Min confidence used: " << min_confidence << std::endl;
-        
+
         return true;
     } catch (const std::exception& e) {
         std::cerr << "Error exporting text file: " << e.what() << "\n";
+        return false;
+    }
+}
+
+// Escape a string for safe inclusion in a JSON string literal. Handles the
+// mandatory JSON escapes (", \) plus the named control chars (\b \f \n \r \t)
+// and any other byte below 0x20 as \uXXXX.
+static std::string json_escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x",
+                                  static_cast<unsigned int>(static_cast<unsigned char>(c)));
+                    out += buf;
+                } else {
+                    out += c;
+                }
+        }
+    }
+    return out;
+}
+
+// Export detected polygons + recognized text as JSON.
+// Each box carries a 1-based "index" within its page, matching the
+// "[i+1/total]" counter printed to stdout during recognition — so a JSON box
+// can be matched to the corresponding text line streamed to the GUI output
+// panel. The page total is boxes.size() (read from the array length).
+//
+// Schema:
+//   { "pages": [ { "index", "filename", "path", "width", "height",
+//                  "boxes": [ { "index", "polygon": [[x,y],[x,y],[x,y],[x,y]],
+//                               "score", "text", "text_confidence" } ] } ] }
+static bool export_json_file(
+    const std::string& output_path,
+    const std::vector<std::string>& image_paths,
+    const std::vector<int>& image_widths,
+    const std::vector<int>& image_heights,
+    const std::vector<std::vector<OCRTextBox>>& all_pages_boxes) {
+
+    try {
+        std::ofstream out_file(output_path);
+        if (!out_file.is_open()) {
+            std::cerr << "Error: Could not open JSON file for writing: " << output_path << "\n";
+            return false;
+        }
+
+        out_file << "{\n  \"pages\": [\n";
+
+        for (size_t page_idx = 0; page_idx < image_paths.size(); page_idx++) {
+            const std::string& image_path = image_paths[page_idx];
+            const std::vector<OCRTextBox>& boxes = all_pages_boxes[page_idx];
+
+            out_file << "    {\n";
+            out_file << "      \"index\": " << (page_idx + 1) << ",\n";
+            out_file << "      \"filename\": \""
+                     << json_escape(fs::path(image_path).filename().string()) << "\",\n";
+            out_file << "      \"path\": \"" << json_escape(image_path) << "\",\n";
+            out_file << "      \"width\": "  << image_widths[page_idx]  << ",\n";
+            out_file << "      \"height\": " << image_heights[page_idx] << ",\n";
+            out_file << "      \"boxes\": [\n";
+
+            for (size_t b = 0; b < boxes.size(); b++) {
+                const OCRTextBox& box = boxes[b];
+                out_file << "        {\n";
+                out_file << "          \"index\": " << (b + 1) << ",\n";
+                out_file << "          \"polygon\": ["
+                         << "[" << box.pts[0] << "," << box.pts[1] << "], "
+                         << "[" << box.pts[2] << "," << box.pts[3] << "], "
+                         << "[" << box.pts[4] << "," << box.pts[5] << "], "
+                         << "[" << box.pts[6] << "," << box.pts[7] << "]],\n";
+                out_file << "          \"score\": " << box.score << ",\n";
+                out_file << "          \"text\": \"" << json_escape(box.text) << "\",\n";
+                out_file << "          \"text_confidence\": " << box.text_confidence << "\n";
+                out_file << "        }" << (b + 1 < boxes.size() ? "," : "") << "\n";
+            }
+
+            out_file << "      ]\n";
+            out_file << "    }" << (page_idx + 1 < image_paths.size() ? "," : "") << "\n";
+        }
+
+        out_file << "  ]\n}\n";
+        out_file.close();
+
+        int total_boxes = 0;
+        for (const auto& pb : all_pages_boxes) total_boxes += (int)pb.size();
+
+        std::cout << "\n Saved JSON file: " << output_path << std::endl;
+        std::cout << "  Total pages: " << image_paths.size() << std::endl;
+        std::cout << "  Total detected regions: " << total_boxes << std::endl;
+
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "Error exporting JSON file: " << e.what() << "\n";
         return false;
     }
 }
@@ -182,9 +286,9 @@ int main(int argc, char** argv) {
 
     std::string det_model = argv[1];
     std::string rec_model = argv[2];
-    
+
     std::vector<std::string> image_paths = collect_image_files(argc, argv, 3);
-    
+
     if (image_paths.empty()) {
         std::cerr << "Error: No valid image files found.\n";
         print_help();
@@ -195,11 +299,12 @@ int main(int argc, char** argv) {
     ReconOptions ropt;
     std::string pdf_output;
     std::string text_output;
+    std::string json_output;
     float min_confidence = 0.3f;
     bool pdf_text_only = false;
-    bool use_text_cls = false;        
-    std::string cls_model_path;       
-    
+    bool use_text_cls = false;
+    std::string cls_model_path;
+
     int option_start = 3 + (int)image_paths.size();
     for (int i = option_start; i < argc; i++) {
         std::string arg = argv[i];
@@ -235,9 +340,11 @@ int main(int argc, char** argv) {
             pdf_text_only = true;
         } else if (arg == "-text" && i + 1 < argc) {
             text_output = argv[++i];
-        } else if (arg == "-textcls" && i + 1 < argc) {  
+        } else if (arg == "-json" && i + 1 < argc) {
+            json_output = argv[++i];
+        } else if (arg == "-textcls" && i + 1 < argc) {
             use_text_cls = (std::stoi(argv[++i]) != 0);
-        } else if (arg == "-clsmodel" && i + 1 < argc) { 
+        } else if (arg == "-clsmodel" && i + 1 < argc) {
             cls_model_path = argv[++i];
         } else {
             std::cerr << "Unknown option: " << arg << "\n";
@@ -269,7 +376,7 @@ int main(int argc, char** argv) {
         if (use_text_cls) {
             std::cout << "Rotation classification model: " << cls_model_path << "\n";
         }
-        
+
         if (!pdf_output.empty()) {
             std::cout << "PDF output: " << pdf_output << " (multi-page)\n";
             std::cout << "Min confidence: " << min_confidence << "\n";
@@ -279,31 +386,35 @@ int main(int argc, char** argv) {
                 std::cout << "PDF mode: Searchable overlay (image background, invisible text)\n";
             }
         }
-        
+
         if (!text_output.empty()) {
             std::cout << "Text output: " << text_output << "\n";
             std::cout << "Min confidence: " << min_confidence << "\n";
         }
-        
+
+        if (!json_output.empty()) {
+            std::cout << "JSON output: " << json_output << "\n";
+        }
+
         std::cout << "---------------------------------------\n";
-        
+
         TextDetector detector(det_model);
         TextRecognizer recognizer(rec_model, ropt);
-        
+
         std::vector<std::string> pdf_image_paths;
         std::vector<int> pdf_image_widths;
         std::vector<int> pdf_image_heights;
         std::vector<std::vector<OCRTextBox>> all_pages_boxes;
-        
+
         int total_text_regions = 0;
         int total_recognized = 0;
-        
+
         for (size_t img_idx = 0; img_idx < image_paths.size(); img_idx++) {
             const std::string& image_path = image_paths[img_idx];
-            
-            std::cout << "\nProcessing image " << (img_idx + 1) << "/" << image_paths.size() 
+
+            std::cout << "\nProcessing image " << (img_idx + 1) << "/" << image_paths.size()
                       << ": " << fs::path(image_path).filename().string() << "\n";
-            
+
             int img_w = 0, img_h = 0, img_channels = 0;
             unsigned char* img_data = stbi_load(image_path.c_str(), &img_w, &img_h, &img_channels, 0);
             if (!img_data) {
@@ -311,16 +422,16 @@ int main(int argc, char** argv) {
                 continue;
             }
             stbi_image_free(img_data);
-            
+
             std::cout << "Image dimensions: " << img_w << "x" << img_h << "\n";
             std::cout << "Running text detection...\n";
-            
+
             auto crops = detector.detect_and_crop(image_path, dopt);
-            
+
             if (crops.empty()) {
                 std::cout << "No text detected in this image.\n";
-                
-                if (!pdf_output.empty() || !text_output.empty()) {
+
+                if (!pdf_output.empty() || !text_output.empty() || !json_output.empty()) {
                     pdf_image_paths.push_back(image_path);
                     pdf_image_widths.push_back(img_w);
                     pdf_image_heights.push_back(img_h);
@@ -328,13 +439,13 @@ int main(int argc, char** argv) {
                 }
                 continue;
             }
-            
+
             std::cout << "Detected " << crops.size() << " text regions.\n";
             std::cout << "Running text recognition...\n";
-            
+
             std::vector<OCRTextBox> ocr_boxes;
             ocr_boxes.reserve(crops.size());
-            
+
             for (size_t i = 0; i < crops.size(); i++) {
                 std::string text = recognizer.recognize(
                     crops[i].data.data(),
@@ -359,73 +470,89 @@ int main(int argc, char** argv) {
                 } else {
                     std::cout << "No text recognized\n";
                 }
-                
+
                 OCRTextBox ocr_box;
-                
+
                 for (int j = 0; j < 8; j++) {
                     ocr_box.pts[j] = crops[i].box.pts[j];
                 }
                 ocr_box.score = crops[i].box.score;
                 ocr_box.text = text;
                 ocr_box.text_confidence = crops[i].box.score;
-                
+
                 ocr_boxes.push_back(ocr_box);
             }
-            
+
             total_text_regions += (int)crops.size();
             for (const auto& box : ocr_boxes) {
                 if (!box.text.empty()) total_recognized++;
             }
-            
-            if (!pdf_output.empty() || !text_output.empty()) {
+
+            if (!pdf_output.empty() || !text_output.empty() || !json_output.empty()) {
                 pdf_image_paths.push_back(image_path);
                 pdf_image_widths.push_back(img_w);
                 pdf_image_heights.push_back(img_h);
                 all_pages_boxes.push_back(ocr_boxes);
             }
         }
-        
+
         if (!text_output.empty() && !pdf_image_paths.empty()) {
             std::cout << "\n---------------------------------------\n";
             std::cout << "Exporting recognized text to file...\n";
-            
+
             bool success = export_text_file(
                 text_output,
                 pdf_image_paths,
                 all_pages_boxes,
                 min_confidence);
-            
+
             if (!success) {
                 std::cerr << "Warning: Text export failed.\n";
             }
         }
-        
+
+        if (!json_output.empty() && !pdf_image_paths.empty()) {
+            std::cout << "\n---------------------------------------\n";
+            std::cout << "Exporting detected regions to JSON...\n";
+
+            bool success = export_json_file(
+                json_output,
+                pdf_image_paths,
+                pdf_image_widths,
+                pdf_image_heights,
+                all_pages_boxes);
+
+            if (!success) {
+                std::cerr << "Warning: JSON export failed.\n";
+            }
+        }
+
         if (!pdf_output.empty() && !pdf_image_paths.empty()) {
             std::cout << "\n---------------------------------------\n";
             std::cout << "Exporting to multi-page searchable PDF...\n";
-            
+
             PDFExporter pdf_exporter;
             bool success = pdf_exporter.createMultiPagePDF(
-                pdf_output, 
-                pdf_image_paths, 
-                pdf_image_widths, 
-                pdf_image_heights, 
-                all_pages_boxes, 
+                pdf_output,
+                pdf_image_paths,
+                pdf_image_widths,
+                pdf_image_heights,
+                all_pages_boxes,
                 min_confidence,
                 pdf_text_only);
-            
+
             if (!success) {
                 std::cerr << "Warning: PDF export failed.\n";
             }
         }
-        
+
         std::cout << "\n=======================================\n";
         std::cout << "Processing Complete\n";
         std::cout << "=======================================\n";
         std::cout << "Total images processed: " << image_paths.size() << "\n";
         std::cout << "Total text regions detected: " << total_text_regions << "\n";
         std::cout << "Successfully recognized: " << total_recognized << "\n";
-        
+
         if (!pdf_output.empty()) {
             std::cout << "Searchable PDF created: " << pdf_output << "\n";
             std::cout << "Total pages in PDF: " << pdf_image_paths.size() << "\n";
@@ -435,12 +562,17 @@ int main(int argc, char** argv) {
                 std::cout << "PDF contains invisible searchable text overlaid on original images.\n";
             }
         }
-        
+
         if (!text_output.empty()) {
             std::cout << "Text file created: " << text_output << "\n";
             std::cout << "Contains recognized text from all images with page separation.\n";
         }
-        
+
+        if (!json_output.empty()) {
+            std::cout << "JSON file created: " << json_output << "\n";
+            std::cout << "Contains detected polygons + recognized text for GUI overlay.\n";
+        }
+
         std::cout << "=======================================\n";
 
         return 0;
