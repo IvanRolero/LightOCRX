@@ -37,7 +37,7 @@ struct CropResult {
 struct DetectOptions {
     float bin_thresh = 0.3f;
     float box_thresh = 0.6f;
-    float unclip_ratio = 2.0f;
+    float unclip_ratio = 1.5f;
     int min_component_area = 50;
     bool save_crops = false;
     bool debug_boxes = false;  // Debug flag for box visualization
