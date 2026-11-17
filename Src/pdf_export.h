@@ -59,9 +59,6 @@ public:
         bool text_only = false);
     
 private:
-    // UTF-8 to WinAnsi conversion for Windows
-    std::string utf8_to_winansi(const std::string& utf8_str);
-    
     // Error handler for libharu
     static void error_handler(HPDF_STATUS error_no, HPDF_STATUS detail_no, void* user_data);
 
