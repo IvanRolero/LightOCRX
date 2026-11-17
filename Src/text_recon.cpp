@@ -1,3 +1,4 @@
+//text_recon.cpp
 /* LightOCRX Lightweight OCR software
  *
  * Copyright (C) 2026 Ivan Rolero
@@ -23,6 +24,7 @@
 #include <locale>
 #include <codecvt>
 #include <cmath>
+#include <limits>
 
 #include "include/onnxruntime_cxx_api.h"
 
@@ -88,19 +90,27 @@ void TextRecognizer::load_dict_or_default(const std::string& dict_path) {
     if (!file.is_open()) {
         // default fallback
         char_dict_.clear();
-        char_dict_.push_back("");
+        char_dict_.push_back("");  // index 0 = CTC blank
         for (int i = 1; i <= 10; i++) char_dict_.push_back(std::string(1, '0' + (i - 1)));
         for (int i = 11; i <= 36; i++) char_dict_.push_back(std::string(1, 'a' + (i - 11)));
         for (int i = 37; i <= 62; i++) char_dict_.push_back(std::string(1, 'A' + (i - 37)));
         return;
     }
 
+    // char_dict_ holds the file's lines verbatim, in order. Index 0 = first
+    // line. The decoder maps model output k to char_dict_[k-1], because the
+    // model's class 0 is the CTC blank (which decode_ctc skips) and classes
+    // 1..N are the N dictionary characters. So we must NOT insert an extra
+    // blank entry here — that would shift every character by one. Empty
+    // lines in the file are skipped (some dict files use a blank line as a
+    // placeholder; the real blank is implicit at model class 0).
     char_dict_.clear();
+
     std::string line;
     while (std::getline(file, line) && (int)char_dict_.size() < opt_.max_dict_size) {
         if (line.empty()) continue;
 
-        if (line == " " || line == "\\s") char_dict_.push_back(" ");
+        if (line == "\\s") char_dict_.push_back(" ");
         else if (line == "\\n") char_dict_.push_back("\n");
         else if (line == "\\t") char_dict_.push_back("\t");
         else char_dict_.push_back(line);
@@ -111,8 +121,34 @@ void TextRecognizer::load_dict_or_default(const std::string& dict_path) {
     }
 }
 
-std::string TextRecognizer::decode_ctc(const float* output, int batch, int time_step, int class_num) {
+std::string TextRecognizer::decode_ctc(const float* output, int batch, int time_step, int class_num,
+                                       float* out_confidence) {
     std::string result;
+
+    // Accumulators for the mean confidence of emitted timesteps.
+    double conf_sum = 0.0;
+    int conf_count = 0;
+
+    // Detect whether the model output is already softmaxed (all values in
+    // [0,1] on the first timestep) or raw logits. PaddleOCR rec models are
+    // usually exported with a softmax head, so the argmax value is already a
+    // calibrated probability; re-softmaxing it would crush every probability
+    // toward 1/N and report ~0% for everything. If we see values outside
+    // [0,1], we apply softmax ourselves.
+    bool already_probs = false;
+    if (batch > 0 && time_step > 0 && class_num > 0) {
+        const float* first = output;
+        already_probs = true;
+        double sum = 0.0;
+        for (int c = 0; c < class_num; c++) {
+            float v = first[c];
+            if (!(v >= 0.0f && v <= 1.0f)) { already_probs = false; break; }
+            sum += v;
+        }
+        // sum should be ~1 for a real probability distribution; if it's way
+        // off, treat as logits to be safe.
+        if (already_probs && (sum < 0.9 || sum > 1.1)) already_probs = false;
+    }
 
     for (int b = 0; b < batch; b++) {
         const float* batch_output = output + b * time_step * class_num;
@@ -121,6 +157,7 @@ std::string TextRecognizer::decode_ctc(const float* output, int batch, int time_
         for (int t = 0; t < time_step; t++) {
             const float* timestep_output = batch_output + t * class_num;
 
+            // Argmax
             int max_idx = 0;
             float max_val = timestep_output[0];
             for (int c = 1; c < class_num; c++) {
@@ -137,6 +174,25 @@ std::string TextRecognizer::decode_ctc(const float* output, int batch, int time_
                         result += char_dict_[dict_idx];
                     }
                     prev_class_idx = max_idx;
+
+                    // Confidence for the chosen class. If the output is
+                    // already a probability distribution, max_val is it.
+                    // Otherwise compute softmax with the max-subtraction
+                    // trick to avoid overflow.
+                    double prob;
+                    if (already_probs) {
+                        prob = max_val;
+                    } else {
+                        double denom = 0.0;
+                        for (int c = 0; c < class_num; c++) {
+                            denom += std::exp(static_cast<double>(timestep_output[c] - max_val));
+                        }
+                        prob = 1.0 / denom;
+                    }
+                    if (prob < 0.0) prob = 0.0;
+                    if (prob > 1.0) prob = 1.0;
+                    conf_sum += prob;
+                    conf_count++;
                 }
             } else {
                 prev_class_idx = -1;
@@ -144,31 +200,76 @@ std::string TextRecognizer::decode_ctc(const float* output, int batch, int time_
         }
     }
 
+    if (out_confidence) {
+        *out_confidence = (conf_count > 0)
+            ? static_cast<float>(conf_sum / conf_count)
+            : 0.0f;
+    }
+
     return result;
 }
 
-std::string TextRecognizer::recognize(const uint8_t* data, int w, int h, int c) {
+std::string TextRecognizer::recognize(const uint8_t* data, int w, int h, int c,
+                                      float* out_confidence) {
+    if (out_confidence) *out_confidence = 0.0f;
     if (!data || w <= 0 || h <= 0) return "";
 
-    // Force RGB input
+    // Convert input to RGB, handling each channel count explicitly. The
+    // previous code used `if (c >= 3)` and indexed src[0..2] with src += c,
+    // which read out of bounds for c == 2 (gray+alpha) and read the wrong
+    // bytes for c > 4.
     std::vector<uint8_t> rgb(w * h * 3);
-    if (c >= 3) {
+    if (c == 3) {
         for (int i = 0; i < w * h; i++) {
-            rgb[i * 3 + 0] = data[i * c + 0];
-            rgb[i * 3 + 1] = data[i * c + 1];
-            rgb[i * 3 + 2] = data[i * c + 2];
+            rgb[i * 3 + 0] = data[i * 3 + 0];
+            rgb[i * 3 + 1] = data[i * 3 + 1];
+            rgb[i * 3 + 2] = data[i * 3 + 2];
+        }
+    } else if (c == 4) {
+        // RGBA: drop alpha
+        for (int i = 0; i < w * h; i++) {
+            rgb[i * 3 + 0] = data[i * 4 + 0];
+            rgb[i * 3 + 1] = data[i * 4 + 1];
+            rgb[i * 3 + 2] = data[i * 4 + 2];
+        }
+    } else if (c == 2) {
+        // Gray+alpha: take gray channel only
+        for (int i = 0; i < w * h; i++) {
+            uint8_t v = data[i * 2 + 0];
+            rgb[i * 3 + 0] = v;
+            rgb[i * 3 + 1] = v;
+            rgb[i * 3 + 2] = v;
+        }
+    } else if (c == 1) {
+        for (int i = 0; i < w * h; i++) {
+            uint8_t v = data[i];
+            rgb[i * 3 + 0] = v;
+            rgb[i * 3 + 1] = v;
+            rgb[i * 3 + 2] = v;
         }
     } else {
+        // Exotic channel counts: take first 3 channels if available, else gray
+        int use_c = std::min(c, 3);
         for (int i = 0; i < w * h; i++) {
-            rgb[i * 3 + 0] = data[i];
-            rgb[i * 3 + 1] = data[i];
-            rgb[i * 3 + 2] = data[i];
+            for (int ch = 0; ch < 3; ch++) {
+                rgb[i * 3 + ch] = (ch < use_c) ? data[i * c + ch] : data[i * c];
+            }
         }
     }
 
-    // Use dynamic width if target_w is 0 or negative, otherwise use fixed width
+    // Target width:
+    //   >0  -> fixed width
+    //   -1  -> pure crop aspect ratio at target height (no min-256 floor)
+    //   0   -> dynamic width with min 256
     int TH = opt_.target_h;
-    int TW = opt_.target_w > 0 ? opt_.target_w : compute_dynamic_width(h, w, TH, 256, 4096);
+    int TW;
+    if (opt_.target_w > 0) {
+        TW = opt_.target_w;
+    } else if (opt_.target_w == -1) {
+        TW = std::max(1, (int)((float)w * TH / std::max(h, 1)));
+    } else {
+        TW = compute_dynamic_width(h, w, TH, 256, 4096);
+    }
 
     float scale_h = (float)TH / h;
     float scale_w = (float)TW / w;
@@ -230,15 +331,28 @@ std::string TextRecognizer::recognize(const uint8_t* data, int w, int h, int c) 
             output_names_.data(),
             output_names_.size());
     } catch (...) {
-        // fallback output name
-        const char* alt_output_names[] = {"save_infer_model/scale_0.tmp_1"};
-        output_tensors = session_.Run(
-            Ort::RunOptions{nullptr},
-            input_names_.data(),
-            &input_tensor,
-            1,
-            alt_output_names,
-            1);
+        // Fallback: try each known output name individually instead of a
+        // single hardcoded name. The session already reported its real
+        // output names; requesting them one at a time covers models whose
+        // multi-output Run fails but a single-output Run succeeds.
+        bool got = false;
+        for (const auto& name : output_names_str_) {
+            try {
+                const char* alt[] = {name.c_str()};
+                output_tensors = session_.Run(
+                    Ort::RunOptions{nullptr},
+                    input_names_.data(),
+                    &input_tensor,
+                    1,
+                    alt,
+                    1);
+                got = true;
+                break;
+            } catch (...) {
+                continue;
+            }
+        }
+        if (!got) return "";
     }
 
     if (output_tensors.empty() || !output_tensors[0].IsTensor()) return "";
@@ -248,9 +362,9 @@ std::string TextRecognizer::recognize(const uint8_t* data, int w, int h, int c) 
     const float* out = output_tensors[0].GetTensorData<float>();
 
     if (shape.size() == 3) {
-        return decode_ctc(out, (int)shape[0], (int)shape[1], (int)shape[2]);
+        return decode_ctc(out, (int)shape[0], (int)shape[1], (int)shape[2], out_confidence);
     } else if (shape.size() == 2) {
-        return decode_ctc(out, 1, (int)shape[0], (int)shape[1]);
+        return decode_ctc(out, 1, (int)shape[0], (int)shape[1], out_confidence);
     }
 
     return "";
