@@ -399,9 +399,11 @@ bool PDFExporter::createMultiPagePDF(
             }
         }
         
-        std::cout << "Added " << text_blocks_added << "text blocks to this page.";
+        // Log line: "Added N text blocks to this page." (with a space before
+        // "text"), optionally followed by "(Skipped ... boxes)".
+        std::cout << "Added " << text_blocks_added << " text blocks to this page.";
         if (page_skipped_boxes > 0) {
-            std::cout << "(Skipped " << page_skipped_boxes << " invalid/malformed boxes)";
+            std::cout << " (Skipped " << page_skipped_boxes << " invalid/malformed boxes)";
             total_skipped_boxes += page_skipped_boxes;
         }
         std::cout << std::endl;
