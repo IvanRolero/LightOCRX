@@ -1,4 +1,3 @@
-//text_recon.cpp
 /* LightOCRX Lightweight OCR software
  *
  * Copyright (C) 2026 Ivan Rolero
