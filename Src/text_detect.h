@@ -19,6 +19,7 @@
 #include <vector>
 #include <string>
 #include <cstdint>
+#include <memory>
 #include "include/onnxruntime_cxx_api.h"
 
 struct TextBox {
@@ -37,7 +38,7 @@ struct CropResult {
 struct DetectOptions {
     float bin_thresh = 0.3f;
     float box_thresh = 0.6f;
-    float unclip_ratio = 1.5f;
+    float unclip_ratio = 2.0f;
     int min_component_area = 50;
     bool save_crops = false;
     bool debug_boxes = false;  // Debug flag for box visualization
@@ -47,13 +48,23 @@ struct DetectOptions {
     std::string cls_model_path = ""; 
 };
 
+// Forward declaration so TextDetector can hold a cached rotation classifier
+// without exposing ONNX Runtime details in this header.
+class RotationCLSModel;
+
 class TextDetector {
 public:
     explicit TextDetector(const std::string& det_model_path);
+    ~TextDetector();
 
-    // Runs detection on input image path and returns crops + box info
+    // Runs detection on input image path and returns crops + box info.
+    // If out_img_w / out_img_h are non-null, they receive the loaded image's
+    // dimensions so callers don't need to load the image a second time just
+    // to learn its size.
     std::vector<CropResult> detect_and_crop(const std::string& image_path,
-                                           const DetectOptions& opt);
+                                           const DetectOptions& opt,
+                                           int* out_img_w = nullptr,
+                                           int* out_img_h = nullptr);
 
 private:
     std::string model_path_;
@@ -65,5 +76,10 @@ private:
     std::vector<const char*> output_names_;
     std::vector<std::string> input_names_str_;
     std::vector<std::string> output_names_str_;
+
+    // Cached rotation classifier so we don't reload the .onnx from disk on
+    // every image. Loaded lazily and reused while cls_model_path is unchanged.
+    std::unique_ptr<RotationCLSModel> cls_model_;
+    std::string cls_model_path_loaded_;
 
 };
