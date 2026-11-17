@@ -77,6 +77,49 @@ private:
     const float mean_[3] = {0.485f, 0.456f, 0.406f};
     const float std_[3] = {0.229f, 0.224f, 0.225f};
 
+    // Convert arbitrary-channel pixel data to a flat RGB buffer.
+    // Handles each channel count explicitly (the old `if (c >= 3)` version
+    // read out of bounds for c == 2 gray+alpha).
+    static std::vector<uint8_t> to_rgb(const std::vector<uint8_t>& img_data,
+                                       int w, int h, int c) {
+        std::vector<uint8_t> rgb(w * h * 3);
+        if (c == 3) {
+            for (int i = 0; i < w * h; i++) {
+                rgb[i * 3 + 0] = img_data[i * 3 + 0];
+                rgb[i * 3 + 1] = img_data[i * 3 + 1];
+                rgb[i * 3 + 2] = img_data[i * 3 + 2];
+            }
+        } else if (c == 4) {
+            for (int i = 0; i < w * h; i++) {
+                rgb[i * 3 + 0] = img_data[i * 4 + 0];
+                rgb[i * 3 + 1] = img_data[i * 4 + 1];
+                rgb[i * 3 + 2] = img_data[i * 4 + 2];
+            }
+        } else if (c == 2) {
+            for (int i = 0; i < w * h; i++) {
+                uint8_t v = img_data[i * 2 + 0];
+                rgb[i * 3 + 0] = v;
+                rgb[i * 3 + 1] = v;
+                rgb[i * 3 + 2] = v;
+            }
+        } else if (c == 1) {
+            for (int i = 0; i < w * h; i++) {
+                uint8_t v = img_data[i];
+                rgb[i * 3 + 0] = v;
+                rgb[i * 3 + 1] = v;
+                rgb[i * 3 + 2] = v;
+            }
+        } else {
+            int use_c = std::min(c, 3);
+            for (int i = 0; i < w * h; i++) {
+                for (int ch = 0; ch < 3; ch++) {
+                    rgb[i * 3 + ch] = (ch < use_c) ? img_data[i * c + ch] : img_data[i * c];
+                }
+            }
+        }
+        return rgb;
+    }
+
 public:
     RotationCLSModel(const std::string& model_path)
         : env_(ORT_LOGGING_LEVEL_WARNING, "ppcls_rotation") {
@@ -110,24 +153,8 @@ public:
 
     std::vector<float> preprocess(const std::vector<uint8_t>& img_data, int w, int h, int c,
                                   std::vector<int64_t>& input_shape) {
-        // Convert to RGB if needed
-        std::vector<uint8_t> rgb_data;
-        if (c >= 3) {
-            rgb_data.resize(w * h * 3);
-            for (int i = 0; i < w * h; i++) {
-                rgb_data[i * 3] = img_data[i * c];
-                rgb_data[i * 3 + 1] = img_data[i * c + 1];
-                rgb_data[i * 3 + 2] = img_data[i * c + 2];
-            }
-        } else {
-            rgb_data.resize(w * h * 3);
-            for (int i = 0; i < w * h; i++) {
-                uint8_t val = img_data[i];
-                rgb_data[i * 3] = val;
-                rgb_data[i * 3 + 1] = val;
-                rgb_data[i * 3 + 2] = val;
-            }
-        }
+        // Convert to RGB (handles gray, gray+alpha, RGB, RGBA explicitly).
+        std::vector<uint8_t> rgb_data = to_rgb(img_data, w, h, c);
 
         // Resize to target dimensions (stretch to fit exactly)
         std::vector<float> input(3 * TARGET_H * TARGET_W);
@@ -208,7 +235,7 @@ public:
         for (size_t i = 1; i < num_elements; i++) {
             if (probs[i] > max_prob) {
                 max_prob = probs[i];
-                max_idx = i;
+                max_idx = (int)i;
             }
         }
         
@@ -601,6 +628,25 @@ static void rotate180(const uint8_t* src_data, int w, int h, int c,
 }
 
 
+// Rotate the 4-point box polygon 180 degrees around the image center and
+// keep the TL,TR,BR,BL ordering consistent with the rotated crop.
+//   new TL = flip(old BR)   new TR = flip(old BL)
+//   new BR = flip(old TL)   new BL = flip(old TR)
+// where flip(x,y) = (img_w - x, img_h - y).
+static void rotate_box_180(TextBox& box, int img_w, int img_h) {
+    TextBox src = box;  // copy of original pts
+    const float flip_pts[8] = {
+        (float)img_w - src.pts[4], (float)img_h - src.pts[5],  // old BR -> new TL
+        (float)img_w - src.pts[6], (float)img_h - src.pts[7],  // old BL -> new TR
+        (float)img_w - src.pts[0], (float)img_h - src.pts[1],  // old TL -> new BR
+        (float)img_w - src.pts[2], (float)img_h - src.pts[3],  // old TR -> new BL
+    };
+    for (int j = 0; j < 8; j++) {
+        box.pts[j] = flip_pts[j];
+    }
+}
+
+
 // Helper function to get points from box coordinates
 static std::vector<PointF> getBoxPoints(const float* pts) {
     std::vector<PointF> box_points(4);
@@ -802,19 +848,36 @@ TextDetector::TextDetector(const std::string& det_model_path)
     std::cout << "Detection model loaded: " << model_path_ << std::endl;
 }
 
+// Destructor must be defined here (in the .cpp where RotationCLSModel is
+// complete) so the unique_ptr<RotationCLSModel> member can be destroyed.
+TextDetector::~TextDetector() = default;
+
 
 std::vector<CropResult> TextDetector::detect_and_crop(const std::string& image_path,
-                                                     const DetectOptions& opt) {
+                                                     const DetectOptions& opt,
+                                                     int* out_img_w,
+                                                     int* out_img_h) {
+    if (out_img_w) *out_img_w = 0;
+    if (out_img_h) *out_img_h = 0;
+
     int img_w, img_h, img_channels;
     uint8_t* img_data = stbi_load(image_path.c_str(), &img_w, &img_h, &img_channels, 0);
     if (!img_data) {
         throw std::runtime_error("Failed to load image: " + image_path);
     }
 
+    // Report the loaded dimensions back to the caller so it doesn't need to
+    // load the image a second time just to learn its size.
+    if (out_img_w) *out_img_w = img_w;
+    if (out_img_h) *out_img_h = img_h;
+
     std::vector<uint8_t> original_image(img_data, img_data + (img_w * img_h * img_channels));
 
+    // Convert to RGB, handling each channel count explicitly (the old
+    // `if (img_channels >= 3)` version read out of bounds for 2-channel
+    // gray+alpha images).
     std::vector<uint8_t> image_rgb;
-    if (img_channels >= 3) {
+    if (img_channels == 3) {
         image_rgb.resize(img_w * img_h * 3);
         auto* src = img_data;
         auto* dst = image_rgb.data();
@@ -822,18 +885,44 @@ std::vector<CropResult> TextDetector::detect_and_crop(const std::string& image_p
             dst[0] = src[0];
             dst[1] = src[1];
             dst[2] = src[2];
-            src += img_channels;
+            src += 3;
             dst += 3;
         }
-    } else {
+    } else if (img_channels == 4) {
         image_rgb.resize(img_w * img_h * 3);
         auto* src = img_data;
         auto* dst = image_rgb.data();
         for (int i = 0; i < img_w * img_h; i++) {
-            uint8_t val = *src++;
+            dst[0] = src[0];
+            dst[1] = src[1];
+            dst[2] = src[2];
+            src += 4;
+            dst += 3;
+        }
+    } else if (img_channels == 2) {
+        // gray + alpha: take gray channel only
+        image_rgb.resize(img_w * img_h * 3);
+        auto* src = img_data;
+        auto* dst = image_rgb.data();
+        for (int i = 0; i < img_w * img_h; i++) {
+            uint8_t val = src[0];
             dst[0] = val;
             dst[1] = val;
             dst[2] = val;
+            src += 2;
+            dst += 3;
+        }
+    } else {
+        // 1-channel gray, or anything else: replicate single value to RGB
+        image_rgb.resize(img_w * img_h * 3);
+        auto* src = img_data;
+        auto* dst = image_rgb.data();
+        for (int i = 0; i < img_w * img_h; i++) {
+            uint8_t val = *src;
+            dst[0] = val;
+            dst[1] = val;
+            dst[2] = val;
+            src += img_channels;
             dst += 3;
         }
     }
@@ -1009,17 +1098,27 @@ std::vector<CropResult> TextDetector::detect_and_crop(const std::string& image_p
         draw_debug_boxes(image_path, boxes, opt.debug_output);
     }
 
-    // Initialize rotation classifier if enabled
-    std::unique_ptr<RotationCLSModel> cls_model;
+    // Load the rotation classifier lazily and cache it. Reuse the cached
+    // model as long as cls_model_path is unchanged, so we don't reload the
+    // .onnx from disk on every image in a batch.
     if (opt.use_rotation_cls && !opt.cls_model_path.empty()) {
-        try {
-            cls_model = std::make_unique<RotationCLSModel>(opt.cls_model_path);
-            std::cout << "Rotation classification model loaded: " << opt.cls_model_path << std::endl;
-        } catch (const std::exception& e) {
-            std::cerr << "Warning: Failed to load rotation classification model: " << e.what() << std::endl;
-            std::cerr << "Rotation correction disabled." << std::endl;
-            cls_model.reset();
+        if (!cls_model_ || cls_model_path_loaded_ != opt.cls_model_path) {
+            try {
+                cls_model_ = std::make_unique<RotationCLSModel>(opt.cls_model_path);
+                cls_model_path_loaded_ = opt.cls_model_path;
+                std::cout << "Rotation classification model loaded: " << opt.cls_model_path << std::endl;
+            } catch (const std::exception& e) {
+                std::cerr << "Warning: Failed to load rotation classification model: " << e.what() << std::endl;
+                std::cerr << "Rotation correction disabled." << std::endl;
+                cls_model_.reset();
+                cls_model_path_loaded_.clear();
+            }
         }
+    } else {
+        // Classification disabled for this call; drop any cached model so a
+        // later enable with a different path reloads cleanly.
+        cls_model_.reset();
+        cls_model_path_loaded_.clear();
     }
 
     std::vector<CropResult> results;
@@ -1046,15 +1145,17 @@ std::vector<CropResult> TextDetector::detect_and_crop(const std::string& image_p
         if (cropped.empty() || cw <= 0 || ch <= 0) continue;
 
         // Apply rotation correction if classifier is enabled
-        if (cls_model) {
+        bool rotated_180 = false;
+        if (cls_model_) {
             try {
-                int rotation = cls_model->run(cropped, cw, ch, img_channels);
+                int rotation = cls_model_->run(cropped, cw, ch, img_channels);
                 
                 if (rotation == 180) {
                     // Rotate the cropped image 180 degrees
                     std::vector<uint8_t> rotated;
                     rotate180(cropped.data(), cw, ch, img_channels, rotated);
                     cropped = std::move(rotated);
+                    rotated_180 = true;
                     
                     std::cout << "    Box " << (i + 1) << ": 180 rotation detected and corrected\n";
                 }
@@ -1066,6 +1167,15 @@ std::vector<CropResult> TextDetector::detect_and_crop(const std::string& image_p
 
         CropResult cr;
         cr.box = boxes[i];
+
+        // If the crop was rotated 180, the box polygon must be rotated to
+        // match the corrected orientation, otherwise the PDF overlay and
+        // JSON polygon will be off (correct for 180 since the bounding
+        // rectangle is preserved, but wrong once 90/270 support is added).
+        if (rotated_180) {
+            rotate_box_180(cr.box, img_w, img_h);
+        }
+
         cr.w = cw;
         cr.h = ch;
         cr.c = img_channels;
@@ -1082,4 +1192,3 @@ std::vector<CropResult> TextDetector::detect_and_crop(const std::string& image_p
     stbi_image_free(img_data);
     return results;
 }
-
