@@ -24,7 +24,7 @@
 struct ReconOptions {
     std::string dict_path = "dict.txt";
     int target_h = 48;
-    int target_w = 0;  
+    int target_w = 0;  // 0 = dynamic width (with min 256), -1 = pure aspect-ratio width, >0 = fixed
     int max_dict_size = 30000;
     bool debug_boxes = false; 
 };
@@ -33,14 +33,19 @@ class TextRecognizer {
 public:
     TextRecognizer(const std::string& rec_model_path, const ReconOptions& opt);
 
-    // Recognize from an in-memory crop image (RGB/RGBA)
-    std::string recognize(const uint8_t* data, int w, int h, int c);
+    // Recognize from an in-memory crop image (RGB/RGBA).
+    // If out_confidence is non-null, it receives the mean softmax probability
+    // of the emitted (non-blank, non-duplicate) timesteps — the actual
+    // recognition confidence, in [0,1].
+    std::string recognize(const uint8_t* data, int w, int h, int c,
+                          float* out_confidence = nullptr);
     
     // Helper to compute dynamic width based on aspect ratio
     static int compute_dynamic_width(int h, int w, int base_h = 48, int min_w = 256, int max_w = 4096);
 
 private:
-    std::string decode_ctc(const float* output, int batch, int time_step, int class_num);
+    std::string decode_ctc(const float* output, int batch, int time_step, int class_num,
+                           float* out_confidence = nullptr);
     void load_dict_or_default(const std::string& dict_path);
 
 private:
@@ -56,4 +61,3 @@ private:
     std::vector<std::string> output_names_str_;
 
 };
-
