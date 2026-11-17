@@ -412,6 +412,34 @@ int main(int argc, char** argv) {
     bool use_text_cls = false;
     std::string cls_model_path;
 
+    // Helper: parse a value into a float, throwing a clear message on bad
+    // input instead of letting std::stof raise std::out_of_range/std::invalid_argument.
+    auto parse_float = [](const std::string& opt, const std::string& val) -> float {
+        try {
+            size_t pos = 0;
+            float v = std::stof(val, &pos);
+            if (pos != val.size()) {
+                throw std::invalid_argument("trailing characters");
+            }
+            return v;
+        } catch (const std::exception&) {
+            throw std::runtime_error("Invalid numeric value for " + opt + ": '" + val + "'");
+        }
+    };
+    auto parse_int = [](const std::string& opt, const std::string& val) -> int {
+        try {
+            size_t pos = 0;
+            int v = std::stoi(val, &pos);
+            if (pos != val.size()) {
+                throw std::invalid_argument("trailing characters");
+            }
+            return v;
+        } catch (const std::exception&) {
+            throw std::runtime_error("Invalid integer value for " + opt + ": '" + val + "'");
+        }
+    };
+
+    try {
     for (int i = option_start; i < argc; i++) {
         std::string arg = argv[i];
 
@@ -419,29 +447,47 @@ int main(int argc, char** argv) {
             print_help();
             return 0;
         } else if (arg == "-boxt" && i + 1 < argc) {
-            dopt.box_thresh = std::stof(argv[++i]);
+            dopt.box_thresh = parse_float("-boxt", argv[++i]);
+            if (dopt.box_thresh < 0.0f || dopt.box_thresh > 1.0f) {
+                throw std::runtime_error("-boxt must be in [0, 1]");
+            }
         } else if (arg == "-bint" && i + 1 < argc) {
-            dopt.bin_thresh = std::stof(argv[++i]);
+            dopt.bin_thresh = parse_float("-bint", argv[++i]);
+            if (dopt.bin_thresh < 0.0f || dopt.bin_thresh > 1.0f) {
+                throw std::runtime_error("-bint must be in [0, 1]");
+            }
         } else if (arg == "-unclip" && i + 1 < argc) {
-            dopt.unclip_ratio = std::stof(argv[++i]);
+            dopt.unclip_ratio = parse_float("-unclip", argv[++i]);
+            if (dopt.unclip_ratio <= 0.0f) {
+                throw std::runtime_error("-unclip must be > 0");
+            }
         } else if (arg == "-targetsize" && i + 1 < argc) {
-            dopt.target_size = std::stoi(argv[++i]);
+            dopt.target_size = parse_int("-targetsize", argv[++i]);
+            if (dopt.target_size < 32) {
+                throw std::runtime_error("-targetsize must be >= 32");
+            }
         } else if (arg == "-savecrops" && i + 1 < argc) {
-            dopt.save_crops = (std::stoi(argv[++i]) != 0);
+            dopt.save_crops = (parse_int("-savecrops", argv[++i]) != 0);
         } else if (arg == "-debugboxes" && i + 1 < argc) {
-            dopt.debug_boxes = (std::stoi(argv[++i]) != 0);
+            dopt.debug_boxes = (parse_int("-debugboxes", argv[++i]) != 0);
         } else if (arg == "-debugout" && i + 1 < argc) {
             dopt.debug_output = argv[++i];
         } else if (arg == "-dict" && i + 1 < argc) {
             ropt.dict_path = argv[++i];
         } else if (arg == "-targetw" && i + 1 < argc) {
-            ropt.target_w = std::stoi(argv[++i]);
+            ropt.target_w = parse_int("-targetw", argv[++i]);
         } else if (arg == "-targeth" && i + 1 < argc) {
-            ropt.target_h = std::stoi(argv[++i]);
+            ropt.target_h = parse_int("-targeth", argv[++i]);
+            if (ropt.target_h <= 0) {
+                throw std::runtime_error("-targeth must be > 0");
+            }
         } else if (arg == "-pdf" && i + 1 < argc) {
             pdf_output = argv[++i];
         } else if (arg == "-minconf" && i + 1 < argc) {
-            min_confidence = std::stof(argv[++i]);
+            min_confidence = parse_float("-minconf", argv[++i]);
+            if (min_confidence < 0.0f || min_confidence > 1.0f) {
+                throw std::runtime_error("-minconf must be in [0, 1]");
+            }
         } else if (arg == "-pdftext") {
             pdf_text_only = true;
         } else if (arg == "-text" && i + 1 < argc) {
@@ -449,7 +495,7 @@ int main(int argc, char** argv) {
         } else if (arg == "-json" && i + 1 < argc) {
             json_output = argv[++i];
         } else if (arg == "-textcls" && i + 1 < argc) {
-            use_text_cls = (std::stoi(argv[++i]) != 0);
+            use_text_cls = (parse_int("-textcls", argv[++i]) != 0);
         } else if (arg == "-clsmodel" && i + 1 < argc) {
             cls_model_path = argv[++i];
         } else {
@@ -457,6 +503,11 @@ int main(int argc, char** argv) {
             print_help();
             return 1;
         }
+    }
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << "\n";
+        print_help();
+        return 1;
     }
 
     // New: Validate that -clsmodel is provided when -textcls 1
@@ -521,18 +572,20 @@ int main(int argc, char** argv) {
             std::cout << "\nProcessing image " << (img_idx + 1) << "/" << image_paths.size()
                       << ": " << fs::path(image_path).filename().string() << "\n";
 
-            int img_w = 0, img_h = 0, img_channels = 0;
-            unsigned char* img_data = stbi_load(image_path.c_str(), &img_w, &img_h, &img_channels, 0);
-            if (!img_data) {
+            std::cout << "Running text detection...\n";
+
+            // detect_and_crop loads the image once and reports its
+            // dimensions back via out-params, so we don't load it a second
+            // time here just to learn its size.
+            int img_w = 0, img_h = 0;
+            auto crops = detector.detect_and_crop(image_path, dopt, &img_w, &img_h);
+
+            if (img_w <= 0 || img_h <= 0) {
                 std::cerr << "Error: Could not load image: " << image_path << "\n";
                 continue;
             }
-            stbi_image_free(img_data);
 
             std::cout << "Image dimensions: " << img_w << "x" << img_h << "\n";
-            std::cout << "Running text detection...\n";
-
-            auto crops = detector.detect_and_crop(image_path, dopt);
 
             if (crops.empty()) {
                 std::cout << "No text detected in this image.\n";
@@ -553,11 +606,13 @@ int main(int argc, char** argv) {
             ocr_boxes.reserve(crops.size());
 
             for (size_t i = 0; i < crops.size(); i++) {
+                float rec_confidence = 0.0f;
                 std::string text = recognizer.recognize(
                     crops[i].data.data(),
                     crops[i].w,
                     crops[i].h,
-                    crops[i].c
+                    crops[i].c,
+                    &rec_confidence
                 );
 
                 size_t start = text.find_first_not_of(" \t\n\r");
@@ -569,9 +624,8 @@ int main(int argc, char** argv) {
                 std::cout << "  [" << (i + 1) << "/" << crops.size() << "] ";
                 if (!text.empty()) {
                     std::cout << "Text: \"" << text << "\"";
-                    if (crops[i].box.score >= 0) {
-                        std::cout << " (Confidence: " << static_cast<int>(crops[i].box.score * 100) << "%)";
-                    }
+                    std::cout << " (Det: " << static_cast<int>(crops[i].box.score * 100)
+                              << "%, Rec: " << static_cast<int>(rec_confidence * 100) << "%)";
                     std::cout << "\n";
                 } else {
                     std::cout << "No text recognized\n";
@@ -582,9 +636,9 @@ int main(int argc, char** argv) {
                 for (int j = 0; j < 8; j++) {
                     ocr_box.pts[j] = crops[i].box.pts[j];
                 }
-                ocr_box.score = crops[i].box.score;
+                ocr_box.score = crops[i].box.score;          // detection confidence
                 ocr_box.text = text;
-                ocr_box.text_confidence = crops[i].box.score;
+                ocr_box.text_confidence = rec_confidence;    // recognition confidence (bug 2 fix)
 
                 ocr_boxes.push_back(ocr_box);
             }
