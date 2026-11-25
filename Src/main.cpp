@@ -55,6 +55,8 @@ Options:
   -targeth <int>    Target height for recognition (default: 48)
   -pdf <path>       Export as searchable PDF (optional, creates multi-page PDF for multiple images)
   -minconf <float>  Minimum confidence for PDF export (default: 0.3)
+  -mindetconf <float>  Minimum detection confidence; boxes below this are skipped from ALL exports (default: 0.0)
+  -minrecconf <float>  Minimum recognition confidence; boxes below this are skipped from ALL exports (default: 0.0)
   -pdftext          Export PDF as text-only (white background, black visible text, no images)
   -text <path>      Export recognized text to a text file (plain text format)
   -json <path>      Export detected polygons + recognized text as JSON (for interactive GUI overlay)
@@ -407,6 +409,8 @@ int main(int argc, char** argv) {
     std::string text_output;
     std::string json_output;
     float min_confidence = 0.3f;
+    float min_det_conf = 0.0f;   // skip boxes below this detection confidence
+    float min_rec_conf = 0.0f;   // skip boxes below this recognition confidence
     bool pdf_text_only = false;
     bool use_text_cls = false;
     std::string cls_model_path;
@@ -487,6 +491,16 @@ int main(int argc, char** argv) {
             if (min_confidence < 0.0f || min_confidence > 1.0f) {
                 throw std::runtime_error("-minconf must be in [0, 1]");
             }
+        } else if (arg == "-mindetconf" && i + 1 < argc) {
+            min_det_conf = parse_float("-mindetconf", argv[++i]);
+            if (min_det_conf < 0.0f || min_det_conf > 1.0f) {
+                throw std::runtime_error("-mindetconf must be in [0, 1]");
+            }
+        } else if (arg == "-minrecconf" && i + 1 < argc) {
+            min_rec_conf = parse_float("-minrecconf", argv[++i]);
+            if (min_rec_conf < 0.0f || min_rec_conf > 1.0f) {
+                throw std::runtime_error("-minrecconf must be in [0, 1]");
+            }
         } else if (arg == "-pdftext") {
             pdf_text_only = true;
         } else if (arg == "-text" && i + 1 < argc) {
@@ -531,6 +545,11 @@ int main(int argc, char** argv) {
         std::cout << "Rotation correction: " << (use_text_cls ? "Enabled" : "Disabled") << "\n";
         if (use_text_cls) {
             std::cout << "Rotation classification model: " << cls_model_path << "\n";
+        }
+        if (min_det_conf > 0.0f || min_rec_conf > 0.0f) {
+            std::cout << "Export confidence filters: min det=" << min_det_conf
+                      << ", min rec=" << min_rec_conf
+                      << " (boxes below either are skipped from all exports)\n";
         }
 
         if (!pdf_output.empty()) {
@@ -651,7 +670,30 @@ int main(int argc, char** argv) {
                 pdf_image_paths.push_back(image_path);
                 pdf_image_widths.push_back(img_w);
                 pdf_image_heights.push_back(img_h);
-                all_pages_boxes.push_back(ocr_boxes);
+
+                // Filter boxes by the -mindetconf / -minrecconf thresholds so
+                // that low-confidence detections and low-confidence recognition
+                // results are skipped from EVERY export (text, JSON, PDF). The
+                // unfiltered ocr_boxes above still feed the console output and
+                // the summary counters, so the user sees everything that was
+                // recognized; only the exported artifacts drop the weak boxes.
+                std::vector<OCRTextBox> exported_boxes;
+                exported_boxes.reserve(ocr_boxes.size());
+                int skipped = 0;
+                for (const auto& box : ocr_boxes) {
+                    if (box.score < min_det_conf ||
+                        box.text_confidence < min_rec_conf) {
+                        skipped++;
+                        continue;
+                    }
+                    exported_boxes.push_back(box);
+                }
+                if (skipped > 0 && (min_det_conf > 0.0f || min_rec_conf > 0.0f)) {
+                    std::cout << "  Skipped " << skipped << " region(s) below "
+                              << "confidence thresholds (det<" << min_det_conf
+                              << " or rec<" << min_rec_conf << ").\n";
+                }
+                all_pages_boxes.push_back(std::move(exported_boxes));
             }
         }
 
